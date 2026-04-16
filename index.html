@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fruit Slash — Neon Arcade</title>
+
+  <!-- Google Fonts: display title + UI text -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Boogaloo&family=Nunito:wght@400;700&display=swap" rel="stylesheet" />
+
+  <!-- Phaser 3 via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+
+  <!-- MediaPipe Hands — loaded before script.js so the global `Hands`
+       constructor is available. We use the 0.4.x legacy bundle which
+       exposes a simple callback-based API and works fully offline via CDN.
+       The wasm/model files are fetched from the same CDN at runtime.     -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.min.js"
+          crossorigin="anonymous"></script>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       WEBCAM LAYER  (z-index: 0)
+       Sits behind the Phaser canvas and all UI overlays.
+       • autoplay / playsinline / muted  →  works on mobile without
+         requiring a user gesture on the video element itself.
+       • CSS handles mirroring (scaleX -1) and object-fit cover.
+       • .cam-active class fades it in once the stream is live.
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="slow-mo-vignette"></div>
+  <video id="webcam" autoplay playsinline muted></video>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       FINGERTIP DOT  (z-index: 15)
+       A small neon circle that tracks the index-finger tip detected
+       by MediaPipe. Positioned by FingerCursor in script.js.
+       Hidden by default; shown only when a hand is detected.
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="finger-dot"></div>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       WEBCAM PERMISSION OVERLAY  (z-index: 200)
+       Shown before the start screen while we ask for camera access.
+       Hidden entirely once the user makes a choice (allow / skip /
+       denied-ok), then the normal start-screen is revealed.
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="cam-overlay">
+
+    <!-- State A: prompt the user -->
+    <div id="cam-prompt">
+      <div class="cam-icon-wrap">📷</div>
+      <h2>Enable Camera?</h2>
+      <p>Your face appears in the background while you play.<br>
+         Video stays on your device — nothing is recorded.</p>
+      <div id="cam-buttons">
+        <button id="cam-allow-btn">Allow Camera</button>
+        <button id="cam-skip-btn">Skip</button>
+      </div>
+    </div>
+
+    <!-- State B: browser denied the request -->
+    <div id="cam-denied" class="hidden">
+      <div class="cam-icon-wrap">🚫</div>
+      <h2>Camera Blocked</h2>
+      <p>Enable camera access in your browser settings<br>
+         to show yourself in the background.</p>
+      <button id="cam-denied-ok-btn">Play Without Camera</button>
+    </div>
+
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       HUD  (z-index: 10) — always on top of the Phaser canvas
+  ════════════════════════════════════════════════════════════════ -->
+  <div id="hud">
+    <div id="score-box">
+      <span id="score-label">SCORE</span>
+      <span id="score-value">0</span>
+    </div>
+    <div id="lives-box">
+      <span id="lives-label">LIVES</span>
+      <div id="lives-icons">
+        <span class="life-icon">🍉</span>
+        <span class="life-icon">🍉</span>
+        <span class="life-icon">🍉</span>
+      </div>
+    </div>
+    <div id="combo-display"></div>
+  </div>
+
+  <!-- Power-up status badges (z-index 25) -->
+  <div id="powerup-hud"></div>
+
+  <!-- Game over overlay -->
+  <div id="game-over-screen" class="hidden">
+    <div id="game-over-card">
+      <h1>GAME OVER</h1>
+      <p id="game-over-reason" class="game-over-reason"></p>
+      <p>Your Score</p>
+      <div id="final-score">0</div>
+      <div id="high-score-display">Best: <span id="high-score-value">0</span></div>
+      <button id="restart-btn">PLAY AGAIN</button>
+    </div>
+  </div>
+
+  <!-- Start screen — hidden initially; shown after cam overlay resolves -->
+  <div id="start-screen" class="hidden">
+    <div id="start-card">
+      <div id="start-emoji">🍉🍊🍋</div>
+      <h1 id="game-title">FRUIT SLASH</h1>
+      <p id="start-tagline">Swipe to slice. Don't miss.</p>
+      <button id="start-btn">START SLICING</button>
+      <p id="hint-text">Slice fruits to score · Miss 3 = game over</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       WEBCAM INIT  — runs before script.js
+       Pure DOM / MediaDevices logic. No globals that touch Phaser.
+  ════════════════════════════════════════════════════════════════ -->
+  <script>
+    (function () {
+      const video        = document.getElementById('webcam');
+      const camOverlay   = document.getElementById('cam-overlay');
+      const camPrompt    = document.getElementById('cam-prompt');
+      const camDenied    = document.getElementById('cam-denied');
+      const allowBtn     = document.getElementById('cam-allow-btn');
+      const skipBtn      = document.getElementById('cam-skip-btn');
+      const deniedOkBtn  = document.getElementById('cam-denied-ok-btn');
+      const startScreen  = document.getElementById('start-screen');
+
+      /** Dismiss the cam overlay and reveal the game start screen. */
+      function proceedToGame() {
+        camOverlay.classList.add('hidden');
+        startScreen.classList.remove('hidden');
+      }
+
+      /** Request camera, attach stream, fade video in. */
+      async function startWebcam() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode : 'user',
+              width      : { ideal: 1280 },
+              height     : { ideal: 720  }
+            },
+            audio: false
+          });
+
+          video.srcObject = stream;
+
+          // Fade the video in once dimensions are known
+          video.addEventListener('loadedmetadata', () => {
+            video.classList.add('cam-active');
+            fitVideo(); // snap to correct cover size immediately
+
+            // Start MediaPipe hand tracking now that the stream is live.
+            // FingerCursor is defined in script.js and is safe to call here
+            // because script.js loads synchronously after this inline block.
+            if (window.FingerCursor) {
+              window.FingerCursor.start(video);
+            }
+          }, { once: true });
+
+          proceedToGame();
+
+        } catch (err) {
+          // NotAllowedError → user blocked; any other error → treat same way
+          console.warn('[Webcam] Permission error:', err.name, err.message);
+          camPrompt.classList.add('hidden');
+          camDenied.classList.remove('hidden');
+        }
+      }
+
+      // ── Button listeners ──────────────────────────────────────────────────
+      allowBtn.addEventListener('click', startWebcam);
+      skipBtn.addEventListener('click', proceedToGame);
+      deniedOkBtn.addEventListener('click', proceedToGame);
+
+      // ── "Cover" resize: keep video filling the viewport ───────────────────
+      // CSS object-fit:cover handles the aspect-ratio cropping automatically,
+      // but we still set explicit w/h so the element truly fills the screen
+      // even before the stream is attached.
+      function fitVideo() {
+        video.style.width  = window.innerWidth  + 'px';
+        video.style.height = window.innerHeight + 'px';
+      }
+      fitVideo();
+      window.addEventListener('resize', fitVideo);
+
+    })();
+  </script>
+
+  <script src="script.js"></script>
+</body>
+</html>
